@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+
+"""
+Lab-Ready Optogenetic TdT DNA Synthesis Simulator (v4.0 - Refined & Enhanced)
+
+A biophysically realistic stochastic simulation of optogenetically controlled
+terminal deoxynucleotidyl transferase (TdT) for template-independent DNA synthesis.
+
+New in v4.0:
+- Cycle mode: one specific dNTP per phase (mixed, target_only, or high_bias)
+- Improved reversible terminators with efficiency parameter
+- Consistent NumPy RNG usage for reproducibility
+- Substrate-dependent dark misincorporation
+- Configurable max extension, wash inefficiency
+- Expanded argparse for parameter exploration
+- Optional plot saving
+- Caged cofactor mode (inspired by real photo-uncaging of Co2+)
+
+Based on first-principles biophysical modeling and recent literature
+(e.g., photo-uncaging of Co2+ for spatial TdT control, 2020; evolved TdTs, 2025).
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from Bio.Seq import Seq
+from collections import defaultdict
+import multiprocessing as mp
+import argparse
+import os
+
+# Physical constants
+AVOGADRO = 6.022e23
+FEMTOLITER = 1e-15
+MOLECULES_PER_uM_fL = AVOGADRO * FEMTOLITER * 1e-6  # ~602 molecules/µM in 1 fL
+
+# Light pulse schedule (10% duty cycle)
+PULSE_ON = 1.0    # seconds
+PULSE_OFF = 9.0   # seconds
+CYCLE_TIME = PULSE_ON + PULSE_OFF
+
+# Example target sequence
+TARGET_EXTENSION = Seq("ATCGATCGATCGATCGATCG")
+print("Target extension to synthesize:")
+print(TARGET_EXTENSION)
+
+
+class GillespieSimulator:
+    def __init__(
+        self,
+        cell_volume_fl=800.0,
+        num_initiators=1000,
+        tdT_conc_uM=0.8,
+        dNTP_conc_uM=300.0,
+        k_cat_base=8.0,
+        Km_uM=100.0,
+        cofactor='Co',  # 'Co' boosts pyrimidines, 'Mg' favors purines
+        pulses_per_phase=2,
+        use_reversible_terminators=False,
+        terminator_efficiency=0.99,
+        stall_length_threshold=15,
+        stall_rate_factor=0.2,
+        track_sequences=True,
+        cycle_mode='mixed',  # 'mixed', 'target_only', 'high_bias'
+        bias_ratio=20.0,     # For high_bias: correct / wrong conc ratio
+        wash_inefficiency=0.001,  # Fraction carry-over from previous phase
+        max_extension_factor=10,
+        activation_mode='dimer',  # 'dimer' (CRY2/CIB1), 'caged_cofactor'
+        dark_leak_dimer=0.05,
+    ):
+        self.cell_volume_fl = cell_volume_fl
+        self.num_initiators = num_initiators
+        self.pulses_per_phase = pulses_per_phase
+        self.phase_duration = pulses_per_phase * CYCLE_TIME
+        self.use_reversible_terminators = use_reversible_terminators
+        self.terminator_efficiency = terminator_efficiency
+        self.track_sequences = track_sequences
+        self.cycle_mode = cycle_mode
+        self.bias_ratio = bias_ratio
+        self.wash_inefficiency = wash_inefficiency
+        self.max_extension_factor = max_extension_factor
+        self.activation_mode = activation_mode
+        self.dark_leak_dimer = dark_leak_dimer
+
+        # TdT molecules
+        self.TdT_total = max(1, int(tdT_conc_uM * MOLECULES_PER_uM_fL * cell_volume_fl))
+
+        # Kinetic parameters
+        self.k_cat_base = k_cat_base
+        self.Km_uM = Km_uM
+        self.misincorp_rate_dark = 0.0005  # Base dark rate (will be scaled)
+        self.Kd_light = 1.0
+        self.Kd_dark = 100.0
+
+        # Base preferences by cofactor
+        base_prefs = {'A': 1.2, 'C': 0.8, 'G': 1.5, 'T': 0.7}  # Mg-like
+        if cofactor == 'Co':
+            base_prefs = {'A': 1.0, 'C': 1.3, 'G': 1.1, 'T': 1.2}
+        self.base_pref_factors = base_prefs
+
+        self.stall_length_threshold = stall_length_threshold
+        self.stall_rate_factor = stall_rate_factor
+        self.max_rate_per_molecule = 100.0
+
+        self.dNTP_conc_uM = dNTP_conc_uM
+        self.molecules_per_uM = MOLECULES_PER_uM_fL * cell_volume_fl
+
+        # Previous phase carry-over (for wash inefficiency)
+        self.prev_dNTP_mols = {'A': 0, 'C': 0, 'G': 0, 'T': 0}
+
+    def light_on(self, t, phase_start):
+        return (t - phase_start) % CYCLE_TIME < PULSE_ON
+
+    def run_single_cell(self, target_seq, seed=None):
+        rng = np.random.default_rng(seed)
+
+        lengths = np.zeros(self.num_initiators, dtype=int)
+        blocked = np.full(self.num_initiators, False)
+        sequences = [""] * self.num_initiators if self.track_sequences else None
+
+        t = 0.0
+        light_exposure = 0.0
+        times = [t]
+        avg_lengths = [0.0]
+        target_len = len(target_seq)
+
+        # Precompute base list
+        bases = ['A', 'C', 'G', 'T']
+
+        for pos in range(target_len + int(target_len * 0.5)):  # Allow reasonable over-extension
+            current_base = target_seq[pos] if pos < target_len else rng.choice(bases)
+            phase_start = t
+
+            # Set dNTP pool for this phase
+            dNTP_molecules = {'A': 0, 'C': 0, 'G': 0, 'T': 0}
+            carry = self.prev_dNTP_mols.copy()
+            for b in bases:
+                carry[b] *= self.wash_inefficiency
+
+            if self.cycle_mode == 'target_only':
+                conc = self.dNTP_conc_uM
+                dNTP_molecules[current_base] = max(1, int(conc * self.molecules_per_uM))
+            elif self.cycle_mode == 'high_bias':
+                correct_conc = self.dNTP_conc_uM * self.bias_ratio / (self.bias_ratio + 3)
+                wrong_conc = self.dNTP_conc_uM / (self.bias_ratio + 3)
+                dNTP_molecules[current_base] = max(1, int(correct_conc * self.molecules_per_uM))
+                for b in bases:
+                    if b != current_base:
+                        dNTP_molecules[b] = max(1, int(wrong_conc * self.molecules_per_uM))
+            else:  # mixed
+                conc = self.dNTP_conc_uM / 4
+                for b in bases:
+                    dNTP_molecules[b] = max(1, int(conc * self.molecules_per_uM))
+
+            # Add carry-over
+            for b in bases:
+                dNTP_molecules[b] += int(carry[b])
+
+            total_dNTP = sum(dNTP_molecules.values())
+            if total_dNTP == 0:
+                break
+
+            # Deblock for reversible terminators
+            if self.use_reversible_terminators:
+                blocked.fill(False)
+
+            while (t - phase_start) < self.phase_duration:
+                light_active = self.light_on(t, phase_start)
+
+                # Activation factor
+                if self.activation_mode == 'dimer':
+                    light_factor = 1.0 if light_active else 0.0
+                    Kd_eff = self.Kd_light * light_factor + self.Kd_dark * (1 - light_factor)
+                    fraction_active = self.dark_leak_dimer + (1 - self.dark_leak_dimer) / (1 + Kd_eff)
+                elif self.activation_mode == 'caged_cofactor':
+                    # Light uncages active cofactor (inspired by real Co2+ uncaging)
+                    fraction_active = 1.0 if light_active else 0.01  # Very low dark
+
+                active_TdT = fraction_active * self.TdT_total
+
+                # Eligible initiators
+                eligible = lengths < target_len * self.max_extension_factor
+                if self.use_reversible_terminators:
+                    eligible &= ~blocked
+                num_eligible = np.sum(eligible)
+                if num_eligible == 0 or total_dNTP <= 0:
+                    break
+
+                # Current concentrations
+                conc_uM = {b: dNTP_molecules[b] / self.molecules_per_uM for b in bases}
+                total_conc_uM = sum(conc_uM.values())
+                mm_factor = total_conc_uM / (total_conc_uM + self.Km_uM) if total_conc_uM > 0 else 0.0
+
+                # Rate per eligible molecule (light)
+                rate_per_eligible_light = self.k_cat_base * mm_factor * active_TdT / num_eligible
+
+                # Dark rate (substrate-dependent, reduced k_cat)
+                dark_k_cat = self.k_cat_base * 0.05
+                dark_rate_per_mol = dark_k_cat * mm_factor * (self.TdT_total - active_TdT) / self.num_initiators
+
+                # Full rates vector
+                rates = np.full(self.num_initiators, dark_rate_per_mol)
+
+                # Add light rate weighted by base availability and preference
+                for b in bases:
+                    base_factor = self.base_pref_factors[b]
+                    prob_b = conc_uM[b] / total_conc_uM if total_conc_uM > 0 else 0.25
+                    rates[eligible] += rate_per_eligible_light * prob_b * base_factor
+
+                # Stalling
+                stalled = lengths >= self.stall_length_threshold
+                rates[stalled] *= self.stall_rate_factor
+
+                # Diffusion cap
+                rates = np.minimum(rates, self.max_rate_per_molecule)
+
+                total_rate = rates.sum()
+                if total_rate <= 0:
+                    break
+
+                # Time to next event
+                tau = rng.exponential(1 / total_rate)
+                next_t = t + tau
+                if light_active:
+                    light_exposure += min(tau, PULSE_ON - (t - phase_start) % CYCLE_TIME)
+
+                t = min(next_t, phase_start + self.phase_duration)
+                if t >= phase_start + self.phase_duration:
+                    break
+
+                # Choose molecule
+                idx = rng.choice(self.num_initiators, p=rates / total_rate)
+
+                # Choose added base (light: biased, dark: random)
+                if light_active and rng.random() < fraction_active:  # Simplified
+                    probs = np.array([conc_uM[b] * self.base_pref_factors[b] for b in bases])
+                    probs /= probs.sum() if probs.sum() > 0 else 1
+                    add_base = rng.choice(bases, p=probs)
+                else:
+                    add_base = rng.choice(bases)
+
+                if sequences is not None:
+                    sequences[idx] += add_base
+                lengths[idx] += 1
+                dNTP_molecules[add_base] -= 1
+                total_dNTP -= 1
+
+                # Block if terminators (with efficiency)
+                if self.use_reversible_terminators and rng.random() < self.terminator_efficiency:
+                    blocked[idx] = True
+
+            # Save carry-over for next phase
+            self.prev_dNTP_mols = dNTP_molecules.copy()
+
+            times.append(t)
+            avg_lengths.append(lengths.mean())
+
+        # Post-simulation analysis
+        result = {
+            'times': times,
+            'avg_lengths': avg_lengths,
+            'final_lengths': lengths.tolist(),
+            'final_avg_extension': lengths.mean(),
+            'total_time': t,
+            'light_exposure': light_exposure,
+            'total_nt_added': int(lengths.sum()),
+        }
+
+        if self.track_sequences:
+            pos_correct = defaultdict(int)
+            pos_total = defaultdict(int)
+            perfect_count = 0
+            for seq in sequences:
+                correct_up_to = 0
+                for i, b in enumerate(seq):
+                    pos_total[i] += 1
+                    if i < target_len and b == target_seq[i]:
+                        pos_correct[i] += 1
+                        correct_up_to += 1
+                if len(seq) == target_len and correct_up_to == target_len:
+                    perfect_count += 1
+
+            per_pos_acc = {p: pos_correct[p] / pos_total[p] if pos_total[p] > 0 else 1.0 for p in sorted(pos_correct)}
+            overall_acc = sum(pos_correct.values()) / sum(pos_total.values()) if sum(pos_total.values()) > 0 else 1.0
+            perfect_fraction = perfect_count / self.num_initiators
+
+            result.update({
+                'final_sequences': sequences,
+                'per_pos_accuracy': per_pos_acc,
+                'overall_base_accuracy': overall_acc,
+                'perfect_fraction': perfect_fraction,
+                'exact_target_fraction': np.mean(lengths == target_len),
+                'at_or_beyond_target': np.mean(lengths >= target_len),
+            })
+
+        return result
+
+    def run_ensemble(self, target_seq, num_cells=20, seed_base=123):
+        seeds = [seed_base + i for i in range(num_cells)]
+        with mp.Pool(os.cpu_count()) as pool:
+            results = pool.starmap(self.run_single_cell, [(target_seq, s) for s in seeds])
+        return results
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Optogenetic TdT DNA synthesis simulator v4.0")
+    parser.add_argument('--mode', choices=['mixed', 'target_only', 'high_bias', 'terminator'], default='mixed',
+                        help='Cycle mode: mixed (equimolar), target_only (correct only), high_bias (strong bias), terminator (high_bias + terminators)')
+    parser.add_argument('--cells', type=int, default=20, help='Number of cells in ensemble')
+    parser.add_argument('--pulses', type=int, default=2, help='Pulses per phase')
+    parser.add_argument('--cofactor', choices=['Mg', 'Co'], default='Co')
+    parser.add_argument('--activation', choices=['dimer', 'caged_cofactor'], default='dimer')
+    parser.add_argument('--save_plots', action='store_true', help='Save plots instead of showing')
+    args = parser.parse_args()
+
+    # Map mode to parameters
+    if args.mode == 'terminator':
+        cycle_mode = 'high_bias'
+        use_terminators = True
+    else:
+        cycle_mode = args.mode
+        use_terminators = False
+
+    sim = GillespieSimulator(
+        pulses_per_phase=args.pulses,
+        cofactor=args.cofactor,
+        cycle_mode=cycle_mode,
+        use_reversible_terminators=use_terminators,
+        terminator_efficiency=0.99,
+        activation_mode=args.activation,
+        track_sequences=True,
+    )
+
+    print(f"Running {args.cells}-cell ensemble | TdT: {sim.TdT_total} molecules | "
+          f"Mode: {args.mode} | Cycle: {cycle_mode} | Terminators: {use_terminators} | "
+          f"Activation: {args.activation} | Cofactor: {args.cofactor}")
+
+    ensemble = sim.run_ensemble(TARGET_EXTENSION, num_cells=args.cells)
+
+    # Summary statistics
+    perfects = [r.get('perfect_fraction', 0) for r in ensemble]
+    accuracies = [r.get('overall_base_accuracy', 0) for r in ensemble]
+    extensions = [r['final_avg_extension'] for r in ensemble]
+
+    print("\nEnsemble Summary:")
+    print(f"  Perfect synthesis fraction: {np.mean(perfects):.3f} ± {np.std(perfects):.3f}")
+    print(f"  Overall base accuracy:      {np.mean(accuracies):.3f} ± {np.std(accuracies):.3f}")
+    print(f"  Mean extension length:      {np.mean(extensions):.2f} nt")
+
+    # Plot representative (first cell)
+    ex = ensemble[0]
+    plt.figure(figsize=(12, 7))
+    plt.plot(ex['times'], ex['avg_lengths'], label='Average extension')
+    plt.axhline(len(TARGET_EXTENSION), color='r', linestyle='--', label='Target length')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Average Extension (nt)')
+    plt.title('Optogenetic TdT Synthesis - Representative Trajectory')
+    plt.grid(True)
+    plt.legend()
+
+    if args.save_plots:
+        plt.savefig('trajectory.png')
+        plt.close()
+    else:
+        plt.show()
+
+    plt.figure(figsize=(10, 5))
+    plt.hist(ex['final_lengths'], bins=range(0, max(ex['final_lengths']) + 5), align='left', rwidth=0.8)
+    plt.axvline(len(TARGET_EXTENSION), color='r', linestyle='--')
+    plt.xlabel('Final Length (nt)')
+    plt.ylabel('Count')
+    plt.title('Final Length Distribution')
+
+    if args.save_plots:
+        plt.savefig('length_distribution.png')
+        plt.close()
+    else:
+        plt.show()
+
+    if 'per_pos_accuracy' in ex and ex['per_pos_accuracy']:
+        pos, acc = zip(*sorted(ex['per_pos_accuracy'].items()))
+        plt.figure(figsize=(10, 5))
+        plt.bar(pos, acc)
+        plt.xlabel('Position')
+        plt.ylabel('Accuracy')
+        plt.title('Per-Position Incorporation Accuracy')
+        plt.ylim(0, 1)
+
+        if args.save_plots:
+            plt.savefig('per_position_accuracy.png')
+            plt.close()
+        else:
+            plt.show()
