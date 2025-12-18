@@ -1,0 +1,146 @@
+# Lab-Ready Optogenetic TdT DNA Synthesis Simulator (v5.0 - Enhanced)
+
+This repository contains a stochastic simulation framework for optogenetic terminal deoxynucleotidyl transferase (TdT)-based enzymatic DNA synthesis in cell-like compartments. The simulator models light-controlled, cycle-by-cycle nucleotide addition using a Gillespie (kinetic Monte Carlo) algorithm and is designed to explore strategies for high-fidelity, template-independent DNA writing at the single-molecule level.
+
+Version 5.0 introduces several lab-relevant features, improved yield metrics, and parameter flexibility to better align with current experimental capabilities in optogenetic TdT systems.
+
+## Key Features
+
+- **Configurable target sequence** via command-line argument
+- **Multiple incorporation modes**:
+  - `mixed`: equal concentration of all four dNTPs
+  - `target_only`: only the correct dNTP supplied each cycle
+  - `high_bias`: strongly biased dNTP ratios (configurable)
+  - `terminator`: high-bias + reversible terminators for quasi-synchronous extension
+- **Optogenetic activation models**:
+  - Light-induced dimerization (default, with configurable dark leak)
+  - Caged cofactor
+- **Reversible terminator support** with configurable blocking efficiency and deblocking success rate (imperfect deblocking leads to irreversible strand loss)
+- **Homopolymer run-length tracking** (max run per strand and ensemble statistics)
+- **Realistic yield metrics**:
+  - Perfect (exact sequence and length)
+  - Length-tolerant (±1 nt with exact sequence prefix)
+  - Low-error (Hamming distance ≤1 within target length window)
+- **dNTP carry-over** due to imperfect washing
+- **Stalling behavior** at long extensions
+- **Ensemble simulation** across multiple independent "cells"
+- **FASTA export** of all synthesized strands with rich metadata (length, Hamming distance, homopolymer run, perfect flag)
+- **Simple parameter sweep mode** for rapid exploration
+- Optional per-cycle dNTP consumption tracking
+
+## Requirements
+
+- Python 3.8+
+- NumPy
+- Matplotlib
+- Biopython
+- Standard library modules only otherwise
+
+Install dependencies with:
+
+```bash
+pip install numpy matplotlib biopython
+```
+
+## Usage
+
+### Basic Run
+
+```bash
+python TdTv5.0.py \
+    --target ATCGATCGATCGATCGATCG \
+    --mode high_bias \
+    --pulses 2 \
+    --cells 50 \
+    --cofactor Co \
+    --activation dimer
+```
+
+### Common Options
+
+| Flag                     | Description                                                                 | Default          |
+|--------------------------|-----------------------------------------------------------------------------|------------------|
+| `--target`               | Target DNA sequence to synthesize (uppercase)                               | ATCGATCG...      |
+| `--mode`                 | Incorporation mode: `mixed`, `target_only`, `high_bias`, `terminator`       | `mixed`          |
+| `--cells`                | Number of independent cells to simulate                                     | 20               |
+| `--pulses`               | Number of light pulses (10 s cycle, 1 s ON) per synthesis phase             | 2                |
+| `--cofactor`             | Mg or Co (affects base incorporation preferences)                           | Co               |
+| `--activation`           | `dimer` or `caged_cofactor`                                                 | dimer            |
+| `--deblock-efficiency`   | Fraction of reversible terminators successfully deblocked (0.0–1.0)        | 1.0              |
+| `--track-consumption`    | Track and report dNTP molecules consumed per phase                          | off              |
+| `--save_plots`           | Save growth trajectory and accuracy plots (not implemented in provided code)| off              |
+| `--sweep`                | Run a small parameter sweep (bias ratio, pulses, terminator efficiency)    | off              |
+
+### Example: Reversible Terminator Mode with Imperfect Deblocking
+
+```bash
+python TdTv5.0.py \
+    --target GCTAGCTAGCTAGCTAGCTA \
+    --mode terminator \
+    --pulses 4 \
+    --deblock-efficiency 0.98 \
+    --cells 100
+```
+
+### Parameter Sweep
+
+```bash
+python TdTv5.0.py --sweep --mode terminator --cells 30
+```
+
+This sweeps bias ratios [10, 20, 50], pulses per phase [1, 2, 4], and terminator efficiencies [0.95, 0.99, 1.0].
+
+## Output
+
+- Console summary of ensemble performance:
+  - Mean ± std of perfect fraction
+  - Overall base-calling accuracy
+  - Length-tolerant yield
+  - Low-error yield
+  - Average maximum homopolymer run length
+- FASTA file `synthesized_strands_v5.fasta` containing every synthesized strand with metadata in the description line:
+  ```
+  >synth_000_00012 len=20 max_run=3 ham=0 PERFECT
+  ATCGATCGATCGATCGATCG
+  ```
+
+## Model Assumptions & Parameters
+
+| Parameter                        | Default Value      | Notes                                                                 |
+|----------------------------------|--------------------|-----------------------------------------------------------------------|
+| Compartment volume               | 800 fL             | ~E. coli-sized                                                       |
+| Initiator molecules              | 1000               | Surface-tethered primers                                             |
+| TdT concentration                | 0.8 µM             | ~800–1000 molecules                                                  |
+| dNTP concentration (nominal)     | 300 µM             | Adjusted per mode                                                    |
+| k_cat (light-activated)          | 8 s⁻¹              | Per active TdT molecule                                              |
+| K_m                              | 100 µM             | Michaelis-Menten constant                                            |
+| Light schedule                   | 1 s ON / 9 s OFF   | 10% duty cycle                                                       |
+| Wash inefficiency                | 0.1% carry-over    | Residual dNTPs between cycles                                        |
+| Stall threshold                  | ≥15 nt             | Rate reduced to 20% beyond this length                               |
+
+Base preferences are tuned separately for Mg²⁺ and Co²⁺ cofactors based on literature trends.
+
+## Customization
+
+The code is intentionally modular. Key sections to modify:
+
+- Base preference factors (`base_pref_factors`)
+- Light activation curve
+- Stalling behavior
+- Additional error models (e.g., deletion, damage)
+
+## License
+
+MIT License — feel free to use, modify, and distribute for research or commercial purposes.
+
+## Citation
+
+If you use this simulator in your work, please cite it as:
+
+> Optogenetic TdT DNA Synthesis Simulator v5.0 (2025). GitHub repository: [link-to-repo].
+
+(Replace with actual repository link once published.)
+
+## Contact / Contributions
+
+Contributions, bug reports, and feature requests are welcome. Open an issue or submit a pull request.
